@@ -8,6 +8,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -64,29 +65,57 @@ object AiClient {
             .url(endpoint)
             .header("Authorization", "Bearer ${config.apiKey}")
             .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
             .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
             .build()
 
         httpClient.newCall(request).execute().use { response ->
             val bodyText = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                val detail = try {
-                    JSONObject(bodyText).optJSONObject("error")?.optString("message")
-                } catch (_: Exception) {
-                    null
-                }
+            val trimmedBody = bodyText.trimStart()
+            val looksLikeHtml = trimmedBody.startsWith("<!DOCTYPE", ignoreCase = true) ||
+                trimmedBody.startsWith("<html", ignoreCase = true)
+
+            if (looksLikeHtml) {
                 throw IllegalStateException(
-                    detail?.takeIf { it.isNotBlank() }
-                        ?: "Permintaan AI gagal (HTTP ${response.code}). Periksa endpoint, model, dan kuota provider."
+                    "Server mengirim halaman HTML, bukan JSON API. Periksa Base URL. " +
+                        "Untuk OpenRouter gunakan https://openrouter.ai/api/v1 (tanpa /chat/completions)."
                 )
             }
 
-            val json = JSONObject(bodyText)
+            val json = try {
+                JSONObject(bodyText)
+            } catch (_: JSONException) {
+                throw IllegalStateException(
+                    "Respons server bukan JSON yang valid (HTTP ${response.code}). " +
+                        "Periksa Base URL dan pastikan penyedia mendukung endpoint OpenAI-compatible."
+                )
+            }
+
+            if (!response.isSuccessful) {
+                val errorObject = json.opt("error")
+                val detail = when (errorObject) {
+                    is JSONObject -> errorObject.optString("message")
+                    is String -> errorObject
+                    else -> json.optString("message")
+                }
+                throw IllegalStateException(
+                    detail.takeIf { it.isNotBlank() && it != "null" }
+                        ?: "Permintaan AI gagal (HTTP ${response.code}). Periksa model, API key, dan kuota provider."
+                )
+            }
+
             val choices = json.optJSONArray("choices")
-                ?: throw IllegalStateException("Respons provider tidak memiliki data choices.")
+                ?: throw IllegalStateException(
+                    "Respons provider tidak memiliki data 'choices'. Periksa apakah model dan endpoint mendukung Chat Completions."
+                )
             val first = choices.optJSONObject(0)
                 ?: throw IllegalStateException("Provider mengembalikan respons kosong.")
-            val content = first.optJSONObject("message")?.optString("content").orEmpty()
+            val message = first.optJSONObject("message")
+            val content = when (val value = message?.opt("content")) {
+                is String -> value
+                is JSONArray -> value.toString()
+                else -> ""
+            }
             content.ifBlank { "Provider tidak mengembalikan teks. Coba model lain." }
         }
     }
